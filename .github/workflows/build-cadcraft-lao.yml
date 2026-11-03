@@ -1,0 +1,44 @@
+name: Build CADCraft with Lao support
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - name: Check out the fork
+        uses: actions/checkout@v4
+
+      - name: Apply the Lao patch
+        shell: bash
+        run: |
+          test -f lao-support.patch || { echo "lao-support.patch is missing in the repository root"; exit 1; }
+          git apply --ignore-whitespace --check lao-support.patch
+          git apply --ignore-whitespace lao-support.patch
+          git diff --stat
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache build files
+        uses: Swatinem/rust-cache@v2
+
+      - name: Test the fonts crate
+        run: cargo test -p cadcraft-fonts --lib
+
+      - name: Build CADCraft
+        run: cargo build --release -p cadcraft
+
+      - name: Collect the exe and the launcher
+        shell: bash
+        run: |
+          mkdir -p dist
+          cp target/release/cadcraft.exe dist/CADCRAFT.EXE
+          printf '@echo off\r\nset CADCRAFT_FONTFALLBACK=Phetsarath OT\r\nstart "" "%%~dp0CADCRAFT.EXE"\r\n' > dist/CADCraft-Lao.bat
+
+      - name: Upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: CADCraft-Lao-windows
+          path: dist/
