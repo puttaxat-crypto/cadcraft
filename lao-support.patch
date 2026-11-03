@@ -1,0 +1,90 @@
+diff --git a/crates/fonts/src/complex.rs b/crates/fonts/src/complex.rs
+index ce2fbcb..df2b0c4 100644
+--- a/crates/fonts/src/complex.rs
++++ b/crates/fonts/src/complex.rs
+@@ -1,4 +1,4 @@
+-//! Lines with right-to-left text or Thai: the line is split into bidi runs in display order
++//! Lines with right-to-left text, Thai or Lao: the line is split into bidi runs in display order
+ //! ([`crate::bidi::visual_runs`]), each run into pieces by the font that draws them (the text's
+ //! font, a fallback font for characters it lacks, or the stroke font), and each font piece is
+ //! shaped with `harfrust` (OpenType GSUB/GPOS: Arabic contextual forms, lam-alef and other
+@@ -23,9 +23,14 @@ use crate::{Shaped, bidi, stroke};
+ const MAX_CHARS: usize = 10_000;
+ 
+ /// Whether a line is laid out here rather than one glyph per character: it has right-to-left
+-/// text, or Thai (see the module notes).
++/// text, Thai or Lao (see the module notes; Lao stacks vowels and tone marks like Thai).
+ pub(crate) fn needed(s: &str) -> bool {
+-    s.chars().any(|c| bidi::is_rtl(c) || is_thai(c))
++    s.chars().any(|c| bidi::is_rtl(c) || is_thai(c) || is_lao(c))
++}
++
++/// Whether `c` is in the Lao block.
++pub(crate) fn is_lao(c: char) -> bool {
++    matches!(c, '\u{0E80}'..='\u{0EFF}')
+ }
+ 
+ /// Whether `c` is in the Thai block.
+@@ -442,6 +447,8 @@ mod tests {
+     fn thai_lines_are_shaped_and_latin_lines_are_not() {
+         assert!(needed("ระดับดินเดิม") && needed("ขนาด 50x50 mm.") && needed("\u{0E4C}"));
+         assert!(needed("abc سلام"));
++        // Lao is shaped too (stacked vowels and tone marks).
++        assert!(needed("ພາສາລາວ") && needed("\u{0EC9}") && !is_thai('\u{0E81}') && is_lao('\u{0E81}'));
+         assert!(!needed("50x50 mm.") && !needed("Ünïcödé %%c25") && !needed(""));
+     }
+ 
+diff --git a/crates/fonts/src/ttf.rs b/crates/fonts/src/ttf.rs
+index bcf610e..78718ea 100644
+--- a/crates/fonts/src/ttf.rs
++++ b/crates/fonts/src/ttf.rs
+@@ -194,6 +194,24 @@ const THAI_FALLBACK: &[&str] = &[
+     "waree",
+     "sarabun",
+ ];
++/// Fonts known to cover Lao: Phetsarath OT (the Lao government standard), then Saysettha OT,
++/// Noto, and the fonts each OS ships (Windows Leelawadee and Lao UI, macOS Lao Sangam MN, the
++/// Linux Lao fonts). Matched as parts of file names.
++const LAO_FALLBACK: &[&str] = &[
++    "phetsarath",
++    "saysettha",
++    "notosanslao",
++    "notoseriflao",
++    "laouiuniversal",
++    "laoui",
++    "leelawui",
++    "leelawadeeui",
++    "leelawad",
++    "laosangam",
++    "dokchampa",
++    "tahoma",
++    "dejavusans",
++];
+ /// Script-specific fallback files loaded per character, at most.
+ const MAX_SCRIPT_FILES: usize = 4;
+ 
+@@ -218,6 +236,7 @@ fn script_fallback(c: char) -> &'static [&'static str] {
+         '\u{0600}'..='\u{08FF}' | '\u{FB50}'..='\u{FDFF}' | '\u{FE70}'..='\u{FEFF}' => ARABIC_FALLBACK,
+         '\u{0590}'..='\u{05FF}' | '\u{FB1D}'..='\u{FB4F}' => HEBREW_FALLBACK,
+         '\u{0E00}'..='\u{0E7F}' => THAI_FALLBACK,
++        '\u{0E80}'..='\u{0EFF}' => LAO_FALLBACK,
+         _ => &[],
+     }
+ }
+@@ -993,7 +1012,15 @@ mod family_tests {
+         for c in ['\u{0E01}', '\u{0E33}', '\u{0E34}', '\u{0E4C}', '\u{0E50}'] {
+             assert!(script_fallback(c).contains(&"notosansthai"), "{c}");
+         }
+-        assert!(script_fallback('a').is_empty() && script_fallback('\u{0E80}').is_empty());
++        assert!(script_fallback('a').is_empty() && script_fallback('\u{0F00}').is_empty());
++        // Lao has its own list, led by Phetsarath OT.
++        for c in ['\u{0E81}', '\u{0EB1}', '\u{0EC9}', '\u{0ED0}'] {
++            assert_eq!(script_fallback(c).first(), Some(&"phetsarath"), "{c}");
++        }
++        let stems: Vec<String> = ["PhetsarathOT", "Phetsarath_OT_Bold", "LeelawUI", "msyh", "NotoSansLao-Regular"].map(String::from).to_vec();
++        let found = script_candidates(&stems, LAO_FALLBACK);
++        assert_eq!(found.first().map(String::as_str), Some("PhetsarathOT"), "{found:?}");
++        assert!(!found.contains(&"msyh".to_string()));
+         // Windows, macOS and Linux each ship one of them under these file names.
+         let stems: Vec<String> = ["LeelawUI", "Thonburi", "Loma", "msyh"].map(norm).to_vec();
+         assert!(stems.iter().filter(|s| THAI_FALLBACK.iter().any(|p| s.contains(p))).count() == 3);
