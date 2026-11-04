@@ -431,6 +431,56 @@ jobs:
           git apply --recount --ignore-whitespace --check lao.patch
           git apply --recount --ignore-whitespace lao.patch
           git diff --stat
+      - name: MTEXT font dropdown (installed fonts, scrollable)
+        continue-on-error: true
+        shell: bash
+        run: |
+          cat > mtext_edit.py <<'PY_EOF'
+          import re, sys
+          p = "crates/ui-egui/src/mtext_editor.rs"
+          s = open(p, encoding="utf-8", newline="").read()
+          s = s.replace("\r\n", "\n")
+
+          loop_re = re.compile(r"for fam in FAMILIES\s*\.iter\(\)\s*\.map\(ToString::to_string\)\s*\.chain\(\s*cur\.font\s*\.clone\(\)\s*\.filter\(\|f\| !FAMILIES\.contains\(&f\.as_str\(\)\)\)\s*\)\s*\{")
+          open_re = re.compile(r"(\.selected_text\(shown\.clone\(\)\)\s*\.show_ui\(ui, \|ui\| \{)")
+          close_re = re.compile(r"(refocus = true;\s*\}\s*\}\s*)(\}\)\s*\.response\s*\.accessible_name\(crate::tl!\(\"Font\"\)\))")
+          const_re = re.compile(r"(const FAMILIES: \[&str; \d+\] = \[[^\]]*\];)")
+
+          FN = '''
+
+          /// The MTEXT font list: the common families, then every installed family (A to Z), and the
+          /// font set on the selection when it is neither (a name from the drawing).
+          fn font_choices(current: Option<&str>) -> Vec<String> {
+              let mut out: Vec<String> = FAMILIES.iter().map(ToString::to_string).collect();
+              for f in cadcraft_fonts::ttf::installed_families() {
+                  if !out.iter().any(|o| o.eq_ignore_ascii_case(&f)) {
+                      out.push(f);
+                  }
+              }
+              if let Some(c) = current
+                  && !out.iter().any(|o| o == c)
+              {
+                  out.insert(0, c.to_string());
+              }
+              out
+          }'''
+
+          checks = [("loop", loop_re), ("open", open_re), ("close", close_re), ("const", const_re)]
+          for name, rx in checks:
+              n = len(rx.findall(s))
+              if n != 1:
+                  print(f"::warning::MTEXT font dropdown NOT applied: pattern '{name}' matched {n} times")
+                  sys.exit(1)
+
+          s = loop_re.sub(lambda m: "for fam in font_choices(cur.font.as_deref()) {", s)
+          s = open_re.sub(lambda m: m.group(1) + '\n egui::ScrollArea::vertical().id_salt("mtext_font_list").max_height(280.0).show(ui, |ui| {', s)
+          s = close_re.sub(lambda m: m.group(1) + "});\n" + m.group(2), s)
+          s = const_re.sub(lambda m: m.group(1) + FN, s)
+          open(p, "w", encoding="utf-8", newline="\n").write(s)
+          print("MTEXT font dropdown applied")
+          PY_EOF
+          python mtext_edit.py
+          git diff --stat
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Test fonts crate
