@@ -34,7 +34,7 @@ jobs:
           -    s.chars().any(|c| bidi::is_rtl(c) || is_thai(c))
           +    s.chars().any(|c| bidi::is_rtl(c) || is_thai(c) || is_lao(c))
           +}
-          +~
+          +
           +/// Whether `c` is in the Lao block.
           +pub(crate) fn is_lao(c: char) -> bool {
           +    matches!(c, '\u{0E80}'..='\u{0EFF}')
@@ -61,17 +61,17 @@ jobs:
           +    raise_lao_tone_marks(face, &mut glyphs);
           +    glyphs
           +}
-          +~
+          +
           +/// Gap kept between a Lao upper vowel and the tone mark above it, in font units (1000 per em).
           +const LAO_MARK_GAP: f64 = 30.0;
-          +~
+          +
           +/// Bottom and top of a placed glyph (outline plus its vertical offset), in font units.
           +fn glyph_extent(face: &Face, g: &Glyph) -> (f64, f64) {
           +    let outline = ttf::glyph_by_id(face, g.gid);
           +    let (lo, hi) = outline.contours.iter().flatten().fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), p| (lo.min(p.y), hi.max(p.y)));
           +    (lo + g.dy, hi + g.dy)
           +}
-          +~
+          +
           +/// A Lao tone mark (ໄມ້ເອກ ໄມ້ໂທ ...) goes above an upper vowel (ິ ີ ຶ ື ັ ົ ໍ) on the same letter. Fonts
           +/// without mark-to-mark positioning for Lao leave both marks at one height, so a tone mark that
           +/// overlaps the vowel under it is raised to just above it. A font that already stacks them is
@@ -168,7 +168,7 @@ jobs:
           +const MAX_NAME_FILES: usize = 6_000;
           +const MAX_NAME_TABLE: u32 = 1 << 20;
           +const MAX_NAME_FACES: u32 = 64;
-          +~
+          +
           +/// The family names of the installed fonts, sorted: what a font list in a text dialog offers.
           +/// Read once, from each file's `name` table only (not the whole font). Embedded craft-fonts
           +/// fonts are listed too. Empty where there are no system fonts (the web build).
@@ -177,17 +177,17 @@ jobs:
           +    g.ensure_families();
           +    g.family_list.clone()
           +}
-          +~
+          +
           +fn be16(b: &[u8], at: usize) -> Option<u16> {
           +    let s = b.get(at..at.checked_add(2)?)?;
           +    Some(u16::from_be_bytes([*s.first()?, *s.get(1)?]))
           +}
-          +~
+          +
           +fn be32(b: &[u8], at: usize) -> Option<u32> {
           +    let s = b.get(at..at.checked_add(4)?)?;
           +    Some(u32::from_be_bytes([*s.first()?, *s.get(1)?, *s.get(2)?, *s.get(3)?]))
           +}
-          +~
+          +
           +/// `len` bytes of `f` from offset `at`.
           +fn read_at(f: &mut std::fs::File, at: u64, len: usize) -> Option<Vec<u8>> {
           +    use std::io::{Read, Seek, SeekFrom};
@@ -196,7 +196,7 @@ jobs:
           +    f.read_exact(&mut v).ok()?;
           +    Some(v)
           +}
-          +~
+          +
           +/// The family names of the fonts in a font file (one per face of a collection), read from the
           +/// `name` tables only. Empty for a file that is not a font. Every offset and length is checked.
           +fn file_families(path: &std::path::Path) -> Vec<String> {
@@ -217,7 +217,7 @@ jobs:
           +    }
           +    out
           +}
-          +~
+          +
           +/// The family name of the font whose table directory is at `off`: the typographic family (name
           +/// id 16) before the plain family (id 1), Windows English before other languages before Mac.
           +fn face_family(f: &mut std::fs::File, off: u64) -> Option<String> {
@@ -261,7 +261,7 @@ jobs:
           +    }
           +    best.map(|(_, n)| n)
           +}
-          +~
+          +
           +/// One record of a `name` table at `at`: platform, language, name id and the raw string.
           +fn name_record(table: &[u8], base: usize, at: usize) -> Option<(u16, u16, u16, &[u8])> {
           +    let platform = be16(table, at)?;
@@ -272,7 +272,7 @@ jobs:
           +    let start = base.checked_add(off)?;
           +    Some((platform, language, id, table.get(start..start.checked_add(len)?)?))
           +}
-          +~
+          +
            fn lock() -> MutexGuard<'static, Db> {
                static DB: OnceLock<Mutex<Db>> = OnceLock::new();
                let mut g = DB.get_or_init(|| Mutex::new(Db::default())).lock().unwrap_or_else(PoisonError::into_inner);
@@ -283,7 +283,7 @@ jobs:
           -        self.by_family(k)
           +        self.by_family(k).or_else(|| self.by_listed_family(k))
           +    }
-          +~
+          +
           +    /// Read the family names of the installed font files once (from their `name` tables only),
           +    /// for the font lists of the text dialogs and for names the file-name search can't match
           +    /// ("Microsoft Himalaya" is in `himalaya.ttf`).
@@ -314,7 +314,7 @@ jobs:
           +        self.family_list.sort_by_key(|n| n.to_lowercase());
           +        self.family_list.dedup_by(|a, b| a.eq_ignore_ascii_case(b.as_str()));
           +    }
-          +~
+          +
           +    /// A face of an installed family by its exact (normalised) family name.
           +    fn by_listed_family(&mut self, k: &str) -> Option<Face> {
           +        let want = norm(k);
@@ -349,11 +349,11 @@ jobs:
                    assert!(dirs.iter().any(|d| d == std::path::Path::new("/usr/share/fonts")), "{dirs:?}");
                }
            }
-          +~
+          +
           +#[cfg(test)]
           +mod name_table_tests {
           +    use super::*;
-          +~
+          +
           +    /// A `name` table (format 0) with one Windows English record of `id` holding `s` (UTF-16BE).
           +    fn table(id: u16, s: &str) -> Vec<u8> {
           +        let units: Vec<u8> = s.encode_utf16().flat_map(u16::to_be_bytes).collect();
@@ -364,7 +364,7 @@ jobs:
           +        t.extend(units);
           +        t
           +    }
-          +~
+          +
           +    #[test]
           +    fn a_name_record_gives_its_string_and_hostile_ones_give_none() {
           +        let t = table(1, "Phetsarath OT");
@@ -377,7 +377,7 @@ jobs:
           +        assert!(name_record(&t, 60_000, 6).is_none());
           +        assert!(be16(&[1], 0).is_none() && be32(&[1, 2, 3], 0).is_none() && be32(&[], usize::MAX).is_none());
           +    }
-          +~
+          +
           +    #[test]
           +    fn a_file_that_is_not_a_font_has_no_families() {
           +        assert!(file_families(std::path::Path::new("/definitely/not/a/font.ttf")).is_empty());
