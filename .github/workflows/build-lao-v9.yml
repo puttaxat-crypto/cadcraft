@@ -1,0 +1,1704 @@
+name: Build Windows LAO v9
+run-name: "LAO v9: ${{ github.event.head_commit.message }}"
+
+# Applies the Lao patch to the checked-out source in CI, tests the fonts crate and
+# builds cadcraft.exe. The patch is NOT committed; nothing in the repo changes.
+# v9 = v8 + a searchable font list (click the font box, type part of a name, the list narrows).
+# v8 = v6 stable (command-line caret, Alice fonts, Lao UI) + Edit Text windows:
+#   double-click on a single-line TEXT / attribute definition opens an Edit Text window, and a double-click
+#   on an MTEXT opens the formatted editor (toolbar, ruler, a font for any selected part) with its own
+#   text loaded. The experimental merge of upstream PR 2320 is dropped: it is a 96-file change that does
+#   not fit this fork. If a window patch cannot apply or compile, the build falls back without it.
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - ".github/workflows/build-lao-v9.yml"
+
+jobs:
+  stable:
+    name: Build (v9 = v8 + searchable font list)
+    runs-on: windows-latest
+    steps:
+      - name: Keep LF line endings (the patch has LF)
+        shell: bash
+        run: git config --global core.autocrlf false
+      - uses: actions/checkout@v4
+      - name: Apply Lao patch
+        shell: bash
+        run: |
+          set -e
+          cat > lao.patch <<'PATCH_EOF'
+          diff --git a/crates/fonts/src/complex.rs b/crates/fonts/src/complex.rs
+          --- a/crates/fonts/src/complex.rs
+          +++ b/crates/fonts/src/complex.rs
+          @@ -23,9 +23,14 @@ use crate::{Shaped, bidi, stroke};
+           const MAX_CHARS: usize = 10_000;
+           
+           /// Whether a line is laid out here rather than one glyph per character: it has right-to-left
+          -/// text, or Thai (see the module notes).
+          +/// text, Thai or Lao (see the module notes; Lao stacks vowels and tone marks like Thai).
+           pub(crate) fn needed(s: &str) -> bool {
+          -    s.chars().any(|c| bidi::is_rtl(c) || is_thai(c))
+          +    s.chars().any(|c| bidi::is_rtl(c) || is_thai(c) || is_lao(c))
+          +}
+          +
+          +/// Whether `c` is in the Lao block.
+          +pub(crate) fn is_lao(c: char) -> bool {
+          +    matches!(c, '\u{0E80}'..='\u{0EFF}')
+           }
+           
+           /// Whether `c` is in the Thai block.
+          @@ -231,7 +236,8 @@ fn shape_run(face: &Face, cs: &[char], r: Range<usize>, rtl: bool) -> Vec<Glyph>
+                   return Vec::new();
+               }
+               let k = 1000.0 / f64::from(shaper.units_per_em().max(1));
+          -    buf.glyph_infos()
+          +    let mut glyphs: Vec<Glyph> = buf
+          +        .glyph_infos()
+                   .iter()
+                   .zip(buf.glyph_positions())
+                   .map(|(gi, gp)| Glyph {
+          @@ -241,7 +247,52 @@ fn shape_run(face: &Face, cs: &[char], r: Range<usize>, rtl: bool) -> Vec<Glyph>
+                       dx: f64::from(gp.x_offset) * k,
+                       dy: f64::from(gp.y_offset) * k,
+                   })
+          -        .collect()
+          +        .collect();
+          +    // Only acts on Lao tone marks that sit on an upper vowel; any other text is left untouched.
+          +    raise_lao_tone_marks(face, &mut glyphs);
+          +    glyphs
+          +}
+          +
+          +/// Gap kept between a Lao upper vowel and the tone mark above it, in font units (1000 per em).
+          +const LAO_MARK_GAP: f64 = 30.0;
+          +
+          +/// Bottom and top of a placed glyph (outline plus its vertical offset), in font units.
+          +fn glyph_extent(face: &Face, g: &Glyph) -> (f64, f64) {
+          +    let outline = ttf::glyph_by_id(face, g.gid);
+          +    let (lo, hi) = outline.contours.iter().flatten().fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), p| (lo.min(p.y), hi.max(p.y)));
+          +    (lo + g.dy, hi + g.dy)
+          +}
+          +
+          +/// A Lao tone mark (ໄມ້ເອກ ໄມ້ໂທ ...) goes above an upper vowel (ິ ີ ຶ ື ັ ົ ໍ) on the same letter. Fonts
+          +/// without mark-to-mark positioning for Lao leave both marks at one height, so a tone mark that
+          +/// overlaps the vowel under it is raised to just above it. A font that already stacks them is
+          +/// left alone: its tone mark is already above the vowel, so nothing is raised.
+          +fn raise_lao_tone_marks(face: &Face, glyphs: &mut [Glyph]) {
+          +    const UPPER_VOWELS: [char; 7] = ['\u{0EB1}', '\u{0EB4}', '\u{0EB5}', '\u{0EB6}', '\u{0EB7}', '\u{0EBB}', '\u{0ECD}'];
+          +    const TONES: [char; 5] = ['\u{0EC8}', '\u{0EC9}', '\u{0ECA}', '\u{0ECB}', '\u{0ECC}'];
+          +    let vowels = face.glyph_ids(&UPPER_VOWELS);
+          +    let tones = face.glyph_ids(&TONES);
+          +    // Glyph 0 is .notdef (a font without Lao): never treat it as a vowel or a tone mark.
+          +    let is_in = |set: &[Option<u32>], gid: u32| gid != 0 && set.contains(&Some(gid));
+          +    if !glyphs.iter().any(|g| is_in(&tones, g.gid)) || !glyphs.iter().any(|g| is_in(&vowels, g.gid)) {
+          +        return;
+          +    }
+          +    // A letter is a glyph with an advance and the zero-advance marks after it.
+          +    let mut start = 0;
+          +    while start < glyphs.len() {
+          +        let end = glyphs.iter().skip(start + 1).position(|g| g.advance.abs() > 0.5).map_or(glyphs.len(), |n| start + 1 + n);
+          +        let Some(group) = glyphs.get_mut(start..end) else { break };
+          +        let top = group.iter().filter(|g| is_in(&vowels, g.gid)).map(|g| glyph_extent(face, g).1).fold(f64::NEG_INFINITY, f64::max);
+          +        if top.is_finite() {
+          +            for g in group.iter_mut().filter(|g| is_in(&tones, g.gid)) {
+          +                let need = top + LAO_MARK_GAP - glyph_extent(face, g).0;
+          +                if need.is_finite() && need > 0.0 {
+          +                    g.dy += need;
+          +                }
+          +            }
+          +        }
+          +        start = end;
+          +    }
+           }
+           
+           /// Longest cluster whose glyphs are matched to its characters by glyph id; the glyphs of a
+          @@ -442,6 +493,8 @@ mod tests {
+               fn thai_lines_are_shaped_and_latin_lines_are_not() {
+                   assert!(needed("ระดับดินเดิม") && needed("ขนาด 50x50 mm.") && needed("\u{0E4C}"));
+                   assert!(needed("abc سلام"));
+          +        // Lao is shaped too (stacked vowels and tone marks).
+          +        assert!(needed("ພາສາລາວ") && needed("\u{0EC9}") && !is_thai('\u{0E81}') && is_lao('\u{0E81}'));
+                   assert!(!needed("50x50 mm.") && !needed("Ünïcödé %%c25") && !needed(""));
+               }
+           
+          diff --git a/crates/fonts/src/ttf.rs b/crates/fonts/src/ttf.rs
+          --- a/crates/fonts/src/ttf.rs
+          +++ b/crates/fonts/src/ttf.rs
+          @@ -194,6 +194,22 @@ const THAI_FALLBACK: &[&str] = &[
+               "waree",
+               "sarabun",
+           ];
+          +/// Fonts known to cover Lao: Phetsarath OT (the Lao government standard), then Saysettha OT,
+          +/// Noto, and the fonts each OS ships (Windows Leelawadee and Lao UI, macOS Lao Sangam MN, the
+          +/// Linux Lao fonts). Matched as parts of file names. Tahoma and DejaVu Sans have no Lao.
+          +const LAO_FALLBACK: &[&str] = &[
+          +    "phetsarath",
+          +    "saysettha",
+          +    "notosanslao",
+          +    "notoseriflao",
+          +    "laouiuniversal",
+          +    "laoui",
+          +    "leelawui",
+          +    "leelawadeeui",
+          +    "leelawad",
+          +    "laosangam",
+          +    "dokchampa",
+          +];
+           /// Script-specific fallback files loaded per character, at most.
+           const MAX_SCRIPT_FILES: usize = 4;
+           
+          @@ -218,6 +234,7 @@ fn script_fallback(c: char) -> &'static [&'static str] {
+                   '\u{0600}'..='\u{08FF}' | '\u{FB50}'..='\u{FDFF}' | '\u{FE70}'..='\u{FEFF}' => ARABIC_FALLBACK,
+                   '\u{0590}'..='\u{05FF}' | '\u{FB1D}'..='\u{FB4F}' => HEBREW_FALLBACK,
+                   '\u{0E00}'..='\u{0E7F}' => THAI_FALLBACK,
+          +        '\u{0E80}'..='\u{0EFF}' => LAO_FALLBACK,
+                   _ => &[],
+               }
+           }
+          @@ -236,6 +253,10 @@ struct Db {
+               fallback: Fallback,
+               /// Bytes of font files loaded from disk so far (bounded by `MAX_LOADED_BYTES`).
+               loaded_bytes: usize,
+          +    /// Installed family names, sorted, and normalised family name → file stem (see `ensure_families`).
+          +    family_list: Vec<String>,
+          +    family_stems: HashMap<String, String>,
+          +    families_built: bool,
+           }
+           
+           /// State of the missing-glyph search.
+          @@ -261,6 +282,116 @@ enum Source {
+               Static(&'static [u8]),
+           }
+           
+          +/// Most font files whose names are read for the font lists, the largest `name` table read, and
+          +/// the most faces read from one collection.
+          +const MAX_NAME_FILES: usize = 6_000;
+          +const MAX_NAME_TABLE: u32 = 1 << 20;
+          +const MAX_NAME_FACES: u32 = 64;
+          +
+          +/// The family names of the installed fonts, sorted: what a font list in a text dialog offers.
+          +/// Read once, from each file's `name` table only (not the whole font). Embedded craft-fonts
+          +/// fonts are listed too. Empty where there are no system fonts (the web build).
+          +pub fn installed_families() -> Vec<String> {
+          +    let mut g = lock();
+          +    g.ensure_families();
+          +    g.family_list.clone()
+          +}
+          +
+          +fn be16(b: &[u8], at: usize) -> Option<u16> {
+          +    let s = b.get(at..at.checked_add(2)?)?;
+          +    Some(u16::from_be_bytes([*s.first()?, *s.get(1)?]))
+          +}
+          +
+          +fn be32(b: &[u8], at: usize) -> Option<u32> {
+          +    let s = b.get(at..at.checked_add(4)?)?;
+          +    Some(u32::from_be_bytes([*s.first()?, *s.get(1)?, *s.get(2)?, *s.get(3)?]))
+          +}
+          +
+          +/// `len` bytes of `f` from offset `at`.
+          +fn read_at(f: &mut std::fs::File, at: u64, len: usize) -> Option<Vec<u8>> {
+          +    use std::io::{Read, Seek, SeekFrom};
+          +    f.seek(SeekFrom::Start(at)).ok()?;
+          +    let mut v = vec![0u8; len];
+          +    f.read_exact(&mut v).ok()?;
+          +    Some(v)
+          +}
+          +
+          +/// The family names of the fonts in a font file (one per face of a collection), read from the
+          +/// `name` tables only. Empty for a file that is not a font. Every offset and length is checked.
+          +fn file_families(path: &std::path::Path) -> Vec<String> {
+          +    let mut out: Vec<String> = Vec::new();
+          +    let Ok(mut f) = std::fs::File::open(path) else { return out };
+          +    let Some(head) = read_at(&mut f, 0, 12) else { return out };
+          +    let offsets: Vec<u64> = if head.get(..4) == Some(b"ttcf".as_slice()) {
+          +        let n = usize::try_from(be32(&head, 8).unwrap_or(0).min(MAX_NAME_FACES)).unwrap_or(0);
+          +        let Some(table) = read_at(&mut f, 12, n * 4) else { return out };
+          +        (0..n).filter_map(|i| be32(&table, i * 4)).map(u64::from).collect()
+          +    } else {
+          +        vec![0]
+          +    };
+          +    for off in offsets {
+          +        if let Some(name) = face_family(&mut f, off).filter(|n| !out.contains(n)) {
+          +            out.push(name);
+          +        }
+          +    }
+          +    out
+          +}
+          +
+          +/// The family name of the font whose table directory is at `off`: the typographic family (name
+          +/// id 16) before the plain family (id 1), Windows English before other languages before Mac.
+          +fn face_family(f: &mut std::fs::File, off: u64) -> Option<String> {
+          +    let dir = read_at(f, off, 12)?;
+          +    let tables = usize::from(be16(&dir, 4)?).min(128);
+          +    let recs = read_at(f, off.checked_add(12)?, tables * 16)?;
+          +    let mut name_table = None;
+          +    for i in 0..tables {
+          +        let at = i * 16;
+          +        if recs.get(at..at + 4) == Some(b"name".as_slice()) {
+          +            name_table = Some((be32(&recs, at + 8)?, be32(&recs, at + 12)?));
+          +            break;
+          +        }
+          +    }
+          +    let (start, len) = name_table?;
+          +    let table = read_at(f, u64::from(start), usize::try_from(len.min(MAX_NAME_TABLE)).ok()?)?;
+          +    let count = usize::from(be16(&table, 2)?).min(2048);
+          +    let base = usize::from(be16(&table, 4)?);
+          +    let mut best: Option<(u8, String)> = None;
+          +    for i in 0..count {
+          +        let Some((platform, language, id, raw)) = name_record(&table, base, 6 + i * 12) else { continue };
+          +        if id != 1 && id != 16 {
+          +            continue;
+          +        }
+          +        let name = match platform {
+          +            0 | 3 => {
+          +                let units: Vec<u16> = raw.chunks_exact(2).filter_map(|c| be16(c, 0)).collect();
+          +                String::from_utf16_lossy(&units)
+          +            }
+          +            1 => raw.iter().map(|b| char::from(*b)).collect(),
+          +            _ => continue,
+          +        };
+          +        let name: String = name.trim().chars().take(100).collect();
+          +        if name.is_empty() || name.starts_with('@') {
+          +            continue;
+          +        }
+          +        let rank = (if id == 16 { 0 } else { 10 }) + if platform == 3 && language == 0x409 { 0 } else if platform == 3 { 1 } else { 2 };
+          +        if best.as_ref().is_none_or(|(r, _)| rank < *r) {
+          +            best = Some((rank, name));
+          +        }
+          +    }
+          +    best.map(|(_, n)| n)
+          +}
+          +
+          +/// One record of a `name` table at `at`: platform, language, name id and the raw string.
+          +fn name_record(table: &[u8], base: usize, at: usize) -> Option<(u16, u16, u16, &[u8])> {
+          +    let platform = be16(table, at)?;
+          +    let language = be16(table, at.checked_add(4)?)?;
+          +    let id = be16(table, at.checked_add(6)?)?;
+          +    let len = usize::from(be16(table, at.checked_add(8)?)?);
+          +    let off = usize::from(be16(table, at.checked_add(10)?)?);
+          +    let start = base.checked_add(off)?;
+          +    Some((platform, language, id, table.get(start..start.checked_add(len)?)?))
+          +}
+          +
+           fn lock() -> MutexGuard<'static, Db> {
+               static DB: OnceLock<Mutex<Db>> = OnceLock::new();
+               let mut g = DB.get_or_init(|| Mutex::new(Db::default())).lock().unwrap_or_else(PoisonError::into_inner);
+          @@ -379,7 +510,52 @@ impl Db {
+                           return Some(face);
+                       }
+                   }
+          -        self.by_family(k)
+          +        self.by_family(k).or_else(|| self.by_listed_family(k))
+          +    }
+          +
+          +    /// Read the family names of the installed font files once (from their `name` tables only),
+          +    /// for the font lists of the text dialogs and for names the file-name search can't match
+          +    /// ("Microsoft Himalaya" is in `himalaya.ttf`).
+          +    fn ensure_families(&mut self) {
+          +        if self.families_built {
+          +            return;
+          +        }
+          +        self.families_built = true;
+          +        let mut files: Vec<(String, PathBuf)> = self
+          +            .paths
+          +            .iter()
+          +            .filter_map(|(stem, src)| match src {
+          +                Source::File(p) => Some((stem.clone(), p.clone())),
+          +                Source::Static(_) => None,
+          +            })
+          +            .collect();
+          +        files.sort();
+          +        for (stem, path) in files.into_iter().take(MAX_NAME_FILES) {
+          +            for name in file_families(&path) {
+          +                self.family_stems.entry(norm(&name)).or_insert_with(|| stem.clone());
+          +                self.family_list.push(name);
+          +            }
+          +        }
+          +        for f in crate::CRAFT_FONTS {
+          +            self.family_stems.insert(norm(f.family), f.stem());
+          +            self.family_list.push(f.family.to_string());
+          +        }
+          +        self.family_list.sort_by_key(|n| n.to_lowercase());
+          +        self.family_list.dedup_by(|a, b| a.eq_ignore_ascii_case(b.as_str()));
+          +    }
+          +
+          +    /// A face of an installed family by its exact (normalised) family name.
+          +    fn by_listed_family(&mut self, k: &str) -> Option<Face> {
+          +        let want = norm(k);
+          +        if want.is_empty() {
+          +            return None;
+          +        }
+          +        self.ensure_families();
+          +        let stem = self.family_stems.get(&want)?.clone();
+          +        let bytes = self.file(&stem)?;
+          +        let all = faces(&bytes);
+          +        let at = all.iter().position(|f| f.names().iter().any(|n| *n == want)).unwrap_or(0);
+          +        all.into_iter().nth(at)
+               }
+           
+               /// A face whose family or full name is `k`, among files with a similar stem, then among the
+          @@ -993,7 +1169,13 @@ mod family_tests {
+                   for c in ['\u{0E01}', '\u{0E33}', '\u{0E34}', '\u{0E4C}', '\u{0E50}'] {
+                       assert!(script_fallback(c).contains(&"notosansthai"), "{c}");
+                   }
+          -        assert!(script_fallback('a').is_empty() && script_fallback('\u{0E80}').is_empty());
+          +        assert!(script_fallback('a').is_empty() && script_fallback('\u{0F00}').is_empty());
+          +        // Lao has its own list, led by Phetsarath OT.
+          +        for c in ['\u{0E81}', '\u{0EB1}', '\u{0EC9}', '\u{0ED0}'] {
+          +            assert_eq!(script_fallback(c).first(), Some(&"phetsarath"), "{c}");
+          +        }
+          +        let lao: Vec<String> = ["PhetsarathOT", "LeelawUI", "NotoSansLao-Regular", "msyh"].map(norm).to_vec();
+          +        assert!(lao.iter().filter(|s| LAO_FALLBACK.iter().any(|p| s.contains(p))).count() == 3);
+                   // Windows, macOS and Linux each ship one of them under these file names.
+                   let stems: Vec<String> = ["LeelawUI", "Thonburi", "Loma", "msyh"].map(norm).to_vec();
+                   assert!(stems.iter().filter(|s| THAI_FALLBACK.iter().any(|p| s.contains(p))).count() == 3);
+          @@ -1120,3 +1302,37 @@ mod scan_tests {
+                   assert!(dirs.iter().any(|d| d == std::path::Path::new("/usr/share/fonts")), "{dirs:?}");
+               }
+           }
+          +
+          +#[cfg(test)]
+          +mod name_table_tests {
+          +    use super::*;
+          +
+          +    /// A `name` table (format 0) with one Windows English record of `id` holding `s` (UTF-16BE).
+          +    fn table(id: u16, s: &str) -> Vec<u8> {
+          +        let units: Vec<u8> = s.encode_utf16().flat_map(u16::to_be_bytes).collect();
+          +        let mut t = Vec::new();
+          +        for v in [0u16, 1, 18, 3, 1, 0x409, id, u16::try_from(units.len()).unwrap_or(0), 0] {
+          +            t.extend(v.to_be_bytes());
+          +        }
+          +        t.extend(units);
+          +        t
+          +    }
+          +
+          +    #[test]
+          +    fn a_name_record_gives_its_string_and_hostile_ones_give_none() {
+          +        let t = table(1, "Phetsarath OT");
+          +        let (platform, language, id, raw) = name_record(&t, 18, 6).unwrap_or((0, 0, 0, &[]));
+          +        assert_eq!((platform, language, id), (3, 0x409, 1));
+          +        let units: Vec<u16> = raw.chunks_exact(2).filter_map(|c| be16(c, 0)).collect();
+          +        assert_eq!(String::from_utf16_lossy(&units), "Phetsarath OT");
+          +        // A record past the end of the table, or a string past it, is refused (no panic).
+          +        assert!(name_record(&t, 18, 1_000).is_none());
+          +        assert!(name_record(&t, 60_000, 6).is_none());
+          +        assert!(be16(&[1], 0).is_none() && be32(&[1, 2, 3], 0).is_none() && be32(&[], usize::MAX).is_none());
+          +    }
+          +
+          +    #[test]
+          +    fn a_file_that_is_not_a_font_has_no_families() {
+          +        assert!(file_families(std::path::Path::new("/definitely/not/a/font.ttf")).is_empty());
+          +    }
+          +}
+          diff --git a/crates/ui-egui/src/managers.rs b/crates/ui-egui/src/managers.rs
+          --- a/crates/ui-egui/src/managers.rs
+          +++ b/crates/ui-egui/src/managers.rs
+          @@ -319,12 +319,22 @@ fn text_style(app: &mut CadApp, ctx: &egui::Context, open: &mut bool) -> Action
+                   no_drawing(ctx, "Text Style", open);
+                   return None;
+               };
+          +    // The built-in stroke font, then every installed family.
+          +    let mut fonts = vec![cadcraft_doc::TextStyle::default().font];
+          +    fonts.extend(cadcraft_fonts::ttf::installed_families());
+               let mut styles: Vec<Style> = d
+                   .text_styles
+                   .iter()
+                   .map(|s| Style {
+                       name: s.name.clone(),
+                       fields: vec![
+          +                Field::Choice("font", "Font", s.font.clone(), {
+          +                    let mut choices = fonts.clone();
+          +                    if !choices.contains(&s.font) {
+          +                        choices.insert(0, s.font.clone());
+          +                    }
+          +                    choices
+          +                }),
+                           Field::Num("height", "Height (0 = ask)", s.height),
+                           Field::Num("widthFactor", "Width factor", s.width_factor),
+                           Field::Bool("backwards", "Backwards", s.backwards),
+          @@ -451,11 +461,13 @@ fn style_manager(ctx: &egui::Context, open: &mut bool, title: &str, cmd: &'static str
+                                       ui.label(*label);
+                                       let mut picked = None;
+                                       craft_ui::ComboBox::from_id_salt((cmd, *key)).selected_text(v.as_str()).show_ui(ui, |ui| {
+          -                                for c in choices {
+          -                                    if ui.selectable_label(c == v, c).clicked() && c != v {
+          -                                        picked = Some(c.clone());
+          +                                egui::ScrollArea::vertical().id_salt((cmd, *key, "choices")).max_height(280.0).show(ui, |ui| {
+          +                                    for c in choices {
+          +                                        if ui.selectable_label(c == v, c).clicked() && c != v {
+          +                                            picked = Some(c.clone());
+          +                                        }
+                                               }
+          -                                }
+          +                                });
+                                       });
+                                       picked.map(|c| (*key, json!(c)))
+                                   }
+          PATCH_EOF
+          git apply --recount --ignore-whitespace --check lao.patch
+          git apply --recount --ignore-whitespace lao.patch
+          git diff --stat
+      - name: MTEXT font dropdown (installed fonts, scrollable)
+        continue-on-error: true
+        shell: bash
+        run: |
+          cat > mtext_edit.py <<'PY_EOF'
+          import re, sys
+          p = "crates/ui-egui/src/mtext_editor.rs"
+          s = open(p, encoding="utf-8", newline="").read()
+          s = s.replace("\r\n", "\n")
+
+          loop_re = re.compile(r"for fam in FAMILIES\s*\.iter\(\)\s*\.map\(ToString::to_string\)\s*\.chain\(\s*cur\.font\s*\.clone\(\)\s*\.filter\(\|f\| !FAMILIES\.contains\(&f\.as_str\(\)\)\)\s*\)\s*\{")
+          open_re = re.compile(r"(\.selected_text\(shown\.clone\(\)\)\s*\.show_ui\(ui, \|ui\| \{)")
+          close_re = re.compile(r"(refocus = true;\s*\}\s*\}\s*)(\}\)\s*\.response\s*\.accessible_name\(crate::tl!\(\"Font\"\)\))")
+          const_re = re.compile(r"(const FAMILIES: \[&str; \d+\] = \[[^\]]*\];)")
+
+          FN = '''
+
+          /// The MTEXT font list: the common families, then every installed family (A to Z), and the
+          /// font set on the selection when it is neither (a name from the drawing).
+          fn font_choices(current: Option<&str>) -> Vec<String> {
+              let mut out: Vec<String> = FAMILIES.iter().map(ToString::to_string).collect();
+              for f in cadcraft_fonts::ttf::installed_families() {
+                  if !out.iter().any(|o| o.eq_ignore_ascii_case(&f)) {
+                      out.push(f);
+                  }
+              }
+              if let Some(c) = current
+                  && !out.iter().any(|o| o == c)
+              {
+                  out.insert(0, c.to_string());
+              }
+              out
+          }'''
+
+          checks = [("loop", loop_re), ("open", open_re), ("close", close_re), ("const", const_re)]
+          for name, rx in checks:
+              n = len(rx.findall(s))
+              if n != 1:
+                  print(f"::warning::MTEXT font dropdown NOT applied: pattern '{name}' matched {n} times")
+                  sys.exit(1)
+
+          s = loop_re.sub(lambda m: "for fam in font_choices(cur.font.as_deref()) {", s)
+          s = open_re.sub(lambda m: m.group(1) + '\n egui::ScrollArea::vertical().id_salt("mtext_font_list").max_height(280.0).show(ui, |ui| {', s)
+          s = close_re.sub(lambda m: m.group(1) + "});\n" + m.group(2), s)
+          s = const_re.sub(lambda m: m.group(1) + FN, s)
+          open(p, "w", encoding="utf-8", newline="\n").write(s)
+          print("MTEXT font dropdown applied")
+          PY_EOF
+          python mtext_edit.py
+          git diff --stat
+      - name: Lao and Thai letters in the interface (MTEXT box, command line)
+        continue-on-error: true
+        shell: bash
+        run: |
+          cat > theme_edit.py <<'PY_EOF'
+          import re, sys
+          p = "crates/ui-egui/src/theme.rs"
+          s = open(p, encoding="utf-8", newline="").read().replace("\r\n", "\n")
+
+          call_re = re.compile(r'(added\.push\(\("system-arabic"\.into\(\), std::sync::Arc::new\(egui::FontData::from_owned\(bytes\)\)\)\);\s*\})')
+          const_re = re.compile(r"(const MAX_UI_FONT_BYTES: u64 = 96 \* 1024 \* 1024;)")
+
+          CALL = '''
+
+                  // ລາວ ແລະ ไทย: installed Lao and Thai faces after the others, in every interface language
+                  // (egui's bundled faces carry neither, so the MTEXT text box, the command line and names in
+                  // those scripts would show boxes).
+                  added.extend(
+                      lao_thai_fonts()
+                          .into_iter()
+                          .filter_map(|p| read_capped(&p, MAX_UI_FONT_BYTES))
+                          .enumerate()
+                          .map(|(i, bytes)| (format!("system-lao-thai-{i}"), std::sync::Arc::new(egui::FontData::from_owned(bytes)))),
+                  );'''
+
+          FN = '''
+
+          /// Installed fonts with Lao and Thai letters, for text in those scripts in the interface (the MTEXT
+          /// text box, the command line, layer and file names): egui's bundled faces have neither. Phetsarath
+          /// OT (the Lao standard) first, then Leelawadee UI and the Noto faces, then other Thai fonts.
+          /// Static faces only (the file names below); at most five are loaded.
+          #[cfg(not(target_arch = "wasm32"))]
+          fn lao_thai_fonts() -> Vec<std::path::PathBuf> {
+              let mut dirs: Vec<std::path::PathBuf> = Vec::new();
+              if cfg!(windows) {
+                  dirs.push("C:\\\\Windows\\\\Fonts".into());
+                  if let Some(local) = std::env::var_os("LOCALAPPDATA") {
+                      dirs.push(std::path::Path::new(&local).join("Microsoft").join("Windows").join("Fonts"));
+                  }
+              } else if cfg!(target_os = "macos") {
+                  dirs.extend(["/System/Library/Fonts", "/System/Library/Fonts/Supplemental", "/Library/Fonts"].map(std::path::PathBuf::from));
+                  if let Some(home) = std::env::var_os("HOME") {
+                      dirs.push(std::path::Path::new(&home).join("Library").join("Fonts"));
+                  }
+              } else {
+                  dirs.extend(
+                      ["/usr/share/fonts/truetype/noto", "/usr/share/fonts/noto", "/usr/share/fonts/opentype/noto", "/usr/share/fonts/truetype/tlwg", "/usr/local/share/fonts"]
+                          .map(std::path::PathBuf::from),
+                  );
+              }
+              const NAMES: &[&str] = &[
+                  "Phetsarath_OT.ttf",
+                  "PhetsarathOT.ttf",
+                  "LeelawUI.ttf",
+                  "leelawad.ttf",
+                  "NotoSansLao-Regular.ttf",
+                  "NotoSansLaoUI-Regular.ttf",
+                  "NotoSansThai-Regular.ttf",
+                  "NotoSansThaiUI-Regular.ttf",
+                  "Saysettha_OT.ttf",
+                  "tahoma.ttf",
+                  "Thonburi.ttc",
+                  "Lao Sangam MN.ttf",
+                  "Ayuthaya.ttf",
+                  "Loma.ttf",
+              ];
+              let mut out: Vec<std::path::PathBuf> = Vec::new();
+              for name in NAMES {
+                  if let Some(found) = dirs.iter().map(|d| d.join(name)).find(|p| p.is_file()) {
+                      out.push(found);
+                      if out.len() == 5 {
+                          break;
+                      }
+                  }
+              }
+              out
+          }'''
+
+          for name, rx in [("call", call_re), ("const", const_re)]:
+              n = len(rx.findall(s))
+              if n != 1:
+                  print(f"::warning::Lao/Thai UI fonts NOT applied: pattern '{name}' matched {n} times")
+                  sys.exit(1)
+          s = call_re.sub(lambda m: m.group(1) + CALL, s)
+          s = const_re.sub(lambda m: m.group(1) + FN, s)
+          open(p, "w", encoding="utf-8", newline="\n").write(s)
+          print("Lao/Thai UI fonts applied")
+          PY_EOF
+          python theme_edit.py
+          git diff --stat
+      # v4: text typed in the MTEXT box is drawn in the font chosen for it, so the legacy Lao fonts
+      # (Alice_0, Alice_1 ...: Latin keys, Lao glyphs) show Lao while typing. Everything above is v3,
+      # unchanged. If this step cannot apply, or its code does not compile, the build falls back to v3.
+      - name: Alice fonts (legacy Lao) - show typed text in the chosen font
+        continue-on-error: true
+        shell: bash
+        run: |
+          mkdir -p .pre-alice
+          cp crates/fonts/src/ttf.rs .pre-alice/ttf.rs
+          cp crates/ui-egui/src/theme.rs .pre-alice/theme.rs
+          cp crates/ui-egui/src/mtext_editor.rs .pre-alice/mtext_editor.rs
+          cat > legacy_edit.py <<'PY_EOF'
+          import sys
+
+
+          def edit(path, fn):
+              s = open(path, encoding="utf-8", newline="").read().replace("\r\n", "\n")
+              s = fn(s)
+              open(path, "w", encoding="utf-8", newline="\n").write(s)
+
+
+          def once(s, old, new, label):
+              n = s.count(old)
+              if n != 1:
+                  print(f"::error::legacy Lao fonts NOT applied: '{label}' matched {n} times")
+                  sys.exit(1)
+              return s.replace(old, new)
+
+
+          # ---- crates/fonts/src/ttf.rs: the bytes of an installed family ----------------------------------
+          TTF_ANCHOR = """pub fn installed_families() -> Vec<String> {
+              let mut g = lock();
+              g.ensure_families();
+              g.family_list.clone()
+          }
+          """
+          TTF_NEW = TTF_ANCHOR + """
+          /// The bytes of the installed font file of the family `name` (its first face), for showing text in
+          /// that font in the interface. `None` when no installed font has that family.
+          pub fn family_bytes(name: &str) -> Option<Vec<u8>> {
+              let mut g = lock();
+              g.ensure_families();
+              let stem = g.family_stems.get(&norm(name))?.clone();
+              let bytes = g.file(&stem)?;
+              Some(bytes.to_vec())
+          }
+          """
+          edit("crates/fonts/src/ttf.rs", lambda s: once(s, TTF_ANCHOR, TTF_NEW, "installed_families"))
+
+          # ---- crates/ui-egui/src/theme.rs: one egui font family per legacy Lao font ----------------------
+          SET_FONTS = "    ctx.set_fonts(fonts);\n}"
+          BLOCK = """    // Legacy-encoded Lao fonts (Alice_0, Alice_1, ...): the Latin keys carry Lao glyphs. Each gets a
+              // family of its own, so the MTEXT box can show what is typed in the font chosen for it. The
+              // interface faces follow in each family, for letters the legacy font lacks.
+              {
+                  let mut registered: Vec<String> = Vec::new();
+                  for fam in cadcraft_fonts::ttf::installed_families() {
+                      let low = fam.to_lowercase();
+                      if !LEGACY_LAO_PREFIXES.iter().any(|p| low.starts_with(p)) {
+                          continue;
+                      }
+                      let Some(bytes) = cadcraft_fonts::ttf::family_bytes(&fam).filter(|b| (b.len() as u64) <= MAX_UI_FONT_BYTES) else {
+                          continue;
+                      };
+                      let key = format!("legacy-lao-{fam}");
+                      fonts.font_data.insert(key.clone(), std::sync::Arc::new(egui::FontData::from_owned(bytes)));
+                      let mut list = vec![key];
+                      list.extend(fonts.families.get(&FontFamily::Proportional).cloned().unwrap_or_default());
+                      fonts.families.insert(FontFamily::Name(fam.as_str().into()), list);
+                      registered.push(fam);
+                  }
+                  *legacy_lao_registry().lock().unwrap_or_else(std::sync::PoisonError::into_inner) = registered;
+              }
+
+          """
+          MONO = "pub fn mono() -> FontId {\n    FontId::new(12.0, FontFamily::Monospace)\n}\n"
+          HELPERS = """
+          /// Name prefixes (lower case) of the legacy-encoded Lao fonts, whose Latin keys carry Lao glyphs.
+          /// Add the prefix of another such font here.
+          const LEGACY_LAO_PREFIXES: &[&str] = &["alice"];
+
+          fn legacy_lao_registry() -> &'static std::sync::Mutex<Vec<String>> {
+              static REGISTRY: std::sync::OnceLock<std::sync::Mutex<Vec<String>>> = std::sync::OnceLock::new();
+              REGISTRY.get_or_init(|| std::sync::Mutex::new(Vec::new()))
+          }
+
+          /// The egui font family that shows text as the font `name` itself, when `name` is a legacy-encoded
+          /// Lao font installed on this machine (`install_fonts` makes one family per such font).
+          pub(crate) fn legacy_lao_family(name: &str) -> Option<FontFamily> {
+              let registry = legacy_lao_registry().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+              registry.iter().find(|n| n.eq_ignore_ascii_case(name)).map(|n| FontFamily::Name(n.as_str().into()))
+          }
+          """
+
+
+          def theme(s):
+              s = once(s, SET_FONTS, BLOCK + SET_FONTS, "set_fonts")
+              s = once(s, MONO, MONO + HELPERS, "mono")
+              return s
+
+
+          edit("crates/ui-egui/src/theme.rs", theme)
+
+          # ---- crates/ui-egui/src/mtext_editor.rs: the text box uses that family ---------------------------
+          OLD = "font_id: FontId::proportional(size),"
+          NEW = """font_id: crate::theme::legacy_lao_family(f.font.as_deref().unwrap_or(fmt.base_font.as_str()))
+                                  .map_or_else(|| FontId::proportional(size), |family| FontId::new(size, family)),"""
+          edit("crates/ui-egui/src/mtext_editor.rs", lambda s: once(s, OLD, NEW, "layouter font_id"))
+          print("legacy Lao fonts applied")
+          PY_EOF
+          if python legacy_edit.py; then
+            touch .alice-applied
+          else
+            cp .pre-alice/ttf.rs crates/fonts/src/ttf.rs
+            cp .pre-alice/theme.rs crates/ui-egui/src/theme.rs
+            cp .pre-alice/mtext_editor.rs crates/ui-egui/src/mtext_editor.rs
+            exit 1
+          fi
+          git diff --stat
+      - name: Command line - caret, insert/erase inside the text, old text on TEXTEDIT
+        continue-on-error: true
+        shell: bash
+        run: |
+          mkdir -p .pre-caret
+          cp crates/ui-egui/src/cmdline.rs .pre-caret/cmdline.rs
+          cat > caret_edit.py <<'PY_EOF'
+          import re, sys
+
+          p = "crates/ui-egui/src/cmdline.rs"
+          s = open(p, encoding="utf-8", newline="").read().replace("\r\n", "\n")
+
+
+          def rx(anchor):
+              return re.compile(r"\s+".join(re.escape(t) for t in anchor.split()))
+
+
+          STRUCT = """pub buffer: String,
+              /// The caret in `buffer` (a char index) and the text it was set for. When anything other than
+              /// the editing keys changes the buffer, the caret goes to its end.
+              caret: usize,
+              caret_buf: String,
+              /// The prompt (message and default) whose old text was already put in the line.
+              prefilled: String,"""
+
+          METHODS = """impl CmdLine {
+              /// The caret as a char index into the buffer; at the end whenever something else changed the buffer.
+              pub fn caret_at(&mut self) -> usize {
+                  let n = self.buffer.chars().count();
+                  if self.caret_buf != self.buffer {
+                      self.caret = n;
+                      self.caret_buf.clone_from(&self.buffer);
+                  }
+                  self.caret = self.caret.min(n);
+                  self.caret
+              }
+
+              fn set_caret(&mut self, at: usize) {
+                  self.caret = at.min(self.buffer.chars().count());
+                  self.caret_buf.clone_from(&self.buffer);
+              }
+
+              /// Insert `s` at the caret (typing in the middle of the line).
+              pub fn insert_at_caret(&mut self, s: &str) {
+                  let at = self.caret_at();
+                  let byte = self.buffer.char_indices().nth(at).map_or(self.buffer.len(), |(i, _)| i);
+                  self.buffer.insert_str(byte, s);
+                  self.set_caret(at + s.chars().count());
+              }
+
+              /// Erase the letter before the caret (`back`) or the one after it.
+              pub fn erase_at_caret(&mut self, back: bool) {
+                  let at = self.caret_at();
+                  let Some(del) = (if back { at.checked_sub(1) } else { Some(at) }) else { return };
+                  if let Some((i, c)) = self.buffer.char_indices().nth(del) {
+                      self.buffer.replace_range(i..i + c.len_utf8(), "");
+                      self.set_caret(del);
+                  }
+              }
+          """
+
+          KEYS = """Key::ArrowLeft if !modifiers.any() && !app.cmd.buffer.is_empty() => {
+                              let at = app.cmd.caret_at();
+                              app.cmd.set_caret(at.saturating_sub(1));
+                          }
+                          Key::ArrowRight if !modifiers.any() && !app.cmd.buffer.is_empty() => {
+                              let at = app.cmd.caret_at();
+                              app.cmd.set_caret(at + 1);
+                          }
+                          Key::Home if !app.cmd.buffer.is_empty() => app.cmd.set_caret(0),
+                          Key::End if !app.cmd.buffer.is_empty() => {
+                              let n = app.cmd.buffer.chars().count();
+                              app.cmd.set_caret(n);
+                          }
+                          Key::Delete if !app.cmd.buffer.is_empty() => app.cmd.erase_at_caret(false),
+                          Key::Tab => tab(app),"""
+
+          PREFILL = """options_still_fit(app);
+
+              // "Enter new text <old text>": start with the old text in the line, so letters can be inserted
+              // or erased inside it (arrows, Home, End, Delete) instead of retyping all of it.
+              let old_text = app
+                  .session
+                  .current_prompt()
+                  .filter(|p| p.accept.text && !p.accept.point && !p.accept.number && !p.raw && p.message.starts_with("Enter new text"))
+                  .and_then(|p| p.default.as_ref().map(ToString::to_string).filter(|d| !d.is_empty()).map(|d| format!("{}|{d}", p.message)));
+              match old_text {
+                  Some(key) => {
+                      if app.cmd.prefilled != key {
+                          if app.cmd.buffer.is_empty()
+                              && let Some((_, d)) = key.split_once('|')
+                          {
+                              app.cmd.buffer = d.to_string();
+                          }
+                          app.cmd.prefilled = key;
+                      }
+                  }
+                  None => {
+                      if !app.session.prompting() {
+                          app.cmd.prefilled.clear();
+                      }
+                  }
+              }"""
+
+          CARET_X = """let at = app.cmd.caret_at();
+              let before: String = app.cmd.buffer.chars().take(at).collect();
+              let mut caret_x = x + if before.len() == app.cmd.buffer.len() { gw } else { p.layout_no_wrap(before, font.clone(), t.text).size().x };"""
+
+          edits = [
+              ("pub buffer: String,", STRUCT),
+              ("impl CmdLine {", METHODS),
+              ("app.cmd.buffer.push_str(&t);", "app.cmd.insert_at_caret(&t);"),
+              ("app.cmd.buffer.push_str(&text);", "app.cmd.insert_at_caret(&text);"),
+              ("app.cmd.buffer.pop();", "app.cmd.erase_at_caret(true);"),
+              ("Key::Tab => tab(app),", KEYS),
+              ("options_still_fit(app);", PREFILL),
+              ("let mut caret_x = x + gw;", CARET_X),
+          ]
+          for anchor, new in edits:
+              n = len(rx(anchor).findall(s))
+              if n != 1:
+                  print(f"::warning::command-line caret NOT applied: '{anchor}' matched {n} times")
+                  sys.exit(1)
+          for anchor, new in edits:
+              s = rx(anchor).sub(lambda m, new=new: new, s)
+          open(p, "w", encoding="utf-8", newline="\n").write(s)
+          print("command-line caret applied")
+          PY_EOF
+          if python caret_edit.py; then
+            touch .caret-applied
+          else
+            cp .pre-caret/cmdline.rs crates/ui-egui/src/cmdline.rs
+            exit 1
+          fi
+          git diff --stat
+      # v7: the Edit Text window for single-line text.
+      - name: Edit Text window (double-click on single-line text)
+        continue-on-error: true
+        shell: bash
+        run: |
+          mkdir -p .pre-edit
+          cp crates/ui-egui/src/lib.rs .pre-edit/lib.rs
+          cp crates/ui-egui/src/dialogs.rs .pre-edit/dialogs.rs
+          cp crates/ui-egui/src/canvas/pick.rs .pre-edit/pick.rs
+          cp crates/ui-egui/src/theme.rs .pre-edit/theme.rs
+          cat > edit_window.py <<'PY_EOF'
+          import os
+          import re
+          import sys
+
+
+          def read(path):
+              return open(path, encoding="utf-8", newline="").read().replace("\r\n", "\n")
+
+
+          def write(path, s):
+              open(path, "w", encoding="utf-8", newline="\n").write(s)
+
+
+          def fail(label, n):
+              print(f"::error::Edit Text window NOT applied: '{label}' matched {n} times")
+              sys.exit(1)
+
+
+          SRC = "crates/ui-egui/src"
+
+          # The font preview row needs the legacy Lao fonts of the Alice step; without it the window is plain.
+          theme_src = read(f"{SRC}/theme.rs")
+          with_preview = "legacy_lao_family" in theme_src and "legacy_lao_registry" in theme_src
+
+          # ---- theme.rs: the list of legacy Lao fonts, for the preview row ----------------------------------
+          if with_preview:
+              anchor = 'const LEGACY_LAO_PREFIXES: &[&str] = &["alice"];\n'
+              if theme_src.count(anchor) != 1:
+                  fail("LEGACY_LAO_PREFIXES", theme_src.count(anchor))
+              theme_src = theme_src.replace(anchor, anchor + """
+          /// The names of the legacy-encoded Lao fonts installed on this machine, for font pickers.
+          pub(crate) fn legacy_lao_families() -> Vec<String> {
+              legacy_lao_registry().lock().unwrap_or_else(std::sync::PoisonError.into_inner).clone()
+          }
+          """.replace("PoisonError.into_inner", "PoisonError::into_inner"))
+              write(f"{SRC}/theme.rs", theme_src)
+
+          # ---- lib.rs: the module ---------------------------------------------------------------------------
+          lib_src = read(f"{SRC}/lib.rs")
+          n = len(re.findall(r"(?m)^mod mtext_editor;$", lib_src))
+          if n != 1:
+              fail("mod mtext_editor;", n)
+          lib_src = re.sub(r"(?m)^mod mtext_editor;$", "mod mtext_editor;\nmod textdlg;", lib_src)
+          write(f"{SRC}/lib.rs", lib_src)
+
+          # ---- dialogs.rs: `textedit:<handle>` goes to the window ---------------------------------------------
+          dlg_src = read(f"{SRC}/dialogs.rs")
+          pat = re.compile(r"(?m)^([ \t]*)other => crate::managers::dialog\(app, ctx, other, &mut open\),$")
+          n = len(pat.findall(dlg_src))
+          if n != 1:
+              fail("managers::dialog arm", n)
+          dlg_src = pat.sub(
+              lambda m: f'{m.group(1)}o if o.starts_with("textedit:") => crate::textdlg::dialog(app, ctx, o, &mut open),\n{m.group(0)}',
+              dlg_src,
+          )
+          write(f"{SRC}/dialogs.rs", dlg_src)
+
+          # ---- canvas/pick.rs: a double-click on single-line text opens the window ----------------------------
+          pick_src = read(f"{SRC}/canvas/pick.rs")
+          old = '    app.start("textedit");\n'
+          if pick_src.count(old) != 1:
+              fail('app.start("textedit")', pick_src.count(old))
+          new = """    // Single-line text and attribute definitions open in the Edit Text window, where the old text
+              // can be changed with the caret, selection, insert and delete; MTEXT keeps its own editor.
+              let single = cadcraft_engine::cmd::curves::pick_at(&app.session, p).and_then(|h| {
+                  let e = app.session.doc().ok()?.entity(h)?;
+                  matches!(e.kind, EntityKind::Text(_) | EntityKind::AttDef(_)).then_some(h)
+              });
+              if let Some(h) = single {
+                  app.ui.dialog = Some(format!("textedit:{}", h.hex()));
+                  return true;
+              }
+          """
+          pick_src = pick_src.replace(old, new + old)
+          write(f"{SRC}/canvas/pick.rs", pick_src)
+
+          # ---- textdlg.rs: the window ---------------------------------------------------------------------------
+          PICKER = """            let families = crate::theme::legacy_lao_families();
+                      if !families.is_empty() {
+                          ui.horizontal_wrapped(|ui| {
+                              ui.small("Preview font:");
+                              if ui.selectable_label(preview.is_empty(), "Default").clicked() {
+                                  preview.clear();
+                              }
+                              for f in &families {
+                                  if ui.selectable_label(preview.eq_ignore_ascii_case(f), f.as_str()).clicked() {
+                                      preview = f.clone();
+                                  }
+                              }
+                          });
+                      }
+          """
+          FONT = """            if let Some(family) = crate::theme::legacy_lao_family(&preview) {
+                          edit = edit.font(egui::FontId::new(20.0, family));
+                      }
+          """
+
+          TEMPLATE = '''//! Edit Text: the window a double-click on a single-line text opens.
+          //!
+          //! TEXTEDIT used to take over the command line, where the old text was out of reach and a change
+          //! meant typing everything again. The window holds the text in an ordinary edit field (caret,
+          //! selection, insert, delete, undo) with OK and Cancel. The engine call is the same (`textedit`
+          //! with a handle and the new text), so undo, locked layers and the DXF round trip behave as before.
+
+          use serde_json::json;
+
+          use crate::CadApp;
+          use cadcraft_engine::doc::EntityKind;
+
+          /// The text the window starts with.
+          fn text_of(k: &EntityKind) -> Option<String> {
+              match k {
+                  EntityKind::Text(t) => Some(t.value.clone()),
+                  EntityKind::AttDef(a) => Some(a.text.value.clone()),
+                  _ => None,
+              }
+          }
+
+          #[derive(Default, Clone)]
+          struct State {
+              handle: String,
+              kind: String,
+              text: String,
+              /// What the drawing holds now, to tell an edit from a no-op.
+              original: String,
+              /// The drawing the window was opened for: a handle means nothing once another drawing is active.
+              uid: u64,
+              message: String,
+              focused: bool,
+          }
+
+          /// Read the object the window is for. A handle that no longer exists, or an object that is not
+          /// text, leaves the window empty instead of failing: the drawing may have changed under it.
+          fn initial(app: &CadApp, hex: &str) -> State {
+              let uid = app.session.state().map(|s| s.uid).unwrap_or_default();
+              let mut st = State { handle: hex.to_string(), uid, ..Default::default() };
+              let Some(h) = cadcraft_doc::Handle::parse_hex(hex) else { return st };
+              let Ok(d) = app.session.doc() else { return st };
+              let Some(e) = d.entity(h) else { return st };
+              st.kind = e.kind.type_name().to_string();
+              st.text = text_of(&e.kind).unwrap_or_default();
+              st.original = st.text.clone();
+              st
+          }
+
+          /// The Edit Text window for `spec`, which is `textedit:<hex handle>`.
+          pub fn dialog(app: &mut CadApp, ctx: &egui::Context, spec: &str, open: &mut bool) {
+              let hex = spec.strip_prefix("textedit:").unwrap_or_default().to_string();
+              let sid = egui::Id::new(("textedit_state", hex.as_str()));
+              let cached: Option<State> = ctx.data_mut(|d| d.get_temp(sid));
+              let mut st = match cached {
+                  Some(s) => s,
+                  None => initial(app, &hex),
+              };
+              let mut keep = *open;
+              let mut commit = false;
+              let mut cancel = false;
+              let field = egui::Id::new(("textedit_field", st.uid, st.handle.as_str()));
+              let pref = egui::Id::new("textedit_preview_font");
+              let mut preview: String = ctx.data_mut(|d| d.get_temp::<String>(pref)).unwrap_or_default();
+              egui::Window::new("Edit Text")
+                  .id(egui::Id::new("textedit_window"))
+                  .open(&mut keep)
+                  .collapsible(false)
+                  .resizable(true)
+                  .default_width(440.0)
+                  .show(ctx, |ui| {
+                      ui.small(format!("{} \\u{b7} {}", st.kind, st.handle));
+          @PICKER@            let mut edit = egui::TextEdit::singleline(&mut st.text).id(field).desired_width(f32::INFINITY).hint_text("Text");
+          @FONT@            let r = ui.add(edit);
+                      if !st.focused {
+                          r.request_focus();
+                          st.focused = true;
+                      }
+                      // Enter applies, as in an ordinary one-line field; Escape closes without applying.
+                      if r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                          commit = true;
+                      }
+                      if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                          cancel = true;
+                      }
+                      ui.horizontal(|ui| {
+                          if ui.button("OK").clicked() {
+                              commit = true;
+                          }
+                          if ui.button("Cancel").clicked() {
+                              cancel = true;
+                          }
+                          ui.small("Enter = OK, Esc = Cancel");
+                      });
+                      if !st.message.is_empty() {
+                          ui.colored_label(ui.visuals().warn_fg_color, st.message.as_str());
+                      }
+                  });
+              if cancel {
+                  keep = false;
+              }
+              if commit {
+                  // Typing and undoing back to the same text is not an edit: closing without a command keeps
+                  // the undo stack clean.
+                  if st.text == st.original {
+                      keep = false;
+                  } else if app.session.state().map(|s| s.uid).ok() != Some(st.uid) {
+                      // The drawing switched while the window sat open: the handle now names another
+                      // drawing's object, so the commit is refused.
+                      st.message = "The drawing changed. Close the window and open it again.".to_string();
+                  } else {
+                      let params = json!({ "handles": [st.handle.clone()], "text": st.text });
+                      match app.run("textedit", params) {
+                          Ok(_) => {
+                              st.original = st.text.clone();
+                              keep = false;
+                          }
+                          Err(e) => st.message = e,
+                      }
+                  }
+              }
+              *open = keep;
+              ctx.data_mut(|d| d.insert_temp(pref, preview));
+              // The state lives exactly as long as the window does: a closed window leaves nothing behind,
+              // so reopening it reads the drawing's text instead of an edit the user cancelled.
+              if keep {
+                  ctx.data_mut(|d| d.insert_temp(sid, st));
+              } else {
+                  ctx.data_mut(|d| {
+                      d.remove_temp::<State>(sid);
+                      d.remove::<egui::text_edit::TextEditState>(field);
+                  });
+              }
+          }
+          '''
+          body = TEMPLATE.replace("@PICKER@", PICKER if with_preview else "").replace("@FONT@", FONT if with_preview else "")
+          if not with_preview:
+              # no font preview: neither the variable nor the field is changed afterwards
+              body = body.replace("let mut preview: String =", "let preview: String =")
+              body = body.replace("let mut edit = egui::TextEdit", "let edit = egui::TextEdit")
+          write(f"{SRC}/textdlg.rs", body)
+          print("Edit Text window applied" + (" (with the font preview row)" if with_preview else " (plain)"))
+          PY_EOF
+          if python edit_window.py; then
+            touch .edit-applied
+          else
+            cp .pre-edit/lib.rs crates/ui-egui/src/lib.rs
+            cp .pre-edit/dialogs.rs crates/ui-egui/src/dialogs.rs
+            cp .pre-edit/pick.rs crates/ui-egui/src/canvas/pick.rs
+            cp .pre-edit/theme.rs crates/ui-egui/src/theme.rs
+            rm -f crates/ui-egui/src/textdlg.rs
+            exit 1
+          fi
+          git status --short
+      # v7: the formatted editor for an existing MTEXT.
+      - name: MTEXT editor window (double-click on MTEXT)
+        continue-on-error: true
+        shell: bash
+        run: |
+          mkdir -p .pre-mtext
+          cp crates/ui-egui/src/mtext_editor.rs .pre-mtext/mtext_editor.rs
+          cp crates/ui-egui/src/dialogs.rs .pre-mtext/dialogs.rs
+          cp crates/ui-egui/src/canvas/pick.rs .pre-mtext/pick.rs
+          cat > mtext_window.py <<'PY_EOF'
+          import re
+          import sys
+
+
+          def read(path):
+              return open(path, encoding="utf-8", newline="").read().replace("\r\n", "\n")
+
+
+          def write(path, s):
+              open(path, "w", encoding="utf-8", newline="\n").write(s)
+
+
+          def fail(label, n):
+              print(f"::error::MTEXT editor window NOT applied: '{label}' matched {n} times")
+              sys.exit(1)
+
+
+          SRC = "crates/ui-egui/src"
+
+          # ---- mtext_editor.rs: the contents parser and the window -----------------------------------------
+          NEW_CODE = r'''/// The font codes in force over a run of MTEXT characters.
+          #[derive(Clone, Default, PartialEq)]
+          struct FontState {
+              font: Option<String>,
+              bold: bool,
+              italic: bool,
+              underline: bool,
+              overline: bool,
+          }
+
+          /// Split MTEXT contents into plain text (a newline for each `\P`) and the runs of it whose font
+          /// codes differ from the default, as (first char, end char, codes). `None` when the contents use
+          /// codes the editor cannot show (stacked fractions, colours, heights, ...): those keep the command
+          /// line, so nothing is lost by editing.
+          fn parse_contents(src: &str) -> Option<(String, Vec<(usize, usize, FontState)>)> {
+              let chars: Vec<char> = src.chars().collect();
+              let mut out: Vec<(char, FontState)> = Vec::new();
+              let mut cur = FontState::default();
+              let mut stack: Vec<FontState> = Vec::new();
+              let mut i = 0;
+              while i < chars.len() {
+                  match chars[i] {
+                      '{' => {
+                          stack.push(cur.clone());
+                          i += 1;
+                      }
+                      '}' => {
+                          cur = stack.pop()?;
+                          i += 1;
+                      }
+                      '\\' => {
+                          let k = *chars.get(i + 1)?;
+                          match k {
+                              '\\' | '{' | '}' => {
+                                  out.push((k, cur.clone()));
+                                  i += 2;
+                              }
+                              'P' => {
+                                  out.push(('\n', cur.clone()));
+                                  i += 2;
+                              }
+                              'L' => {
+                                  cur.underline = true;
+                                  i += 2;
+                              }
+                              'l' => {
+                                  cur.underline = false;
+                                  i += 2;
+                              }
+                              'O' => {
+                                  cur.overline = true;
+                                  i += 2;
+                              }
+                              'o' => {
+                                  cur.overline = false;
+                                  i += 2;
+                              }
+                              'f' => {
+                                  // \fName|b0|i0|c0|p0; : the charset and pitch parts carry nothing here.
+                                  let end = i + 2 + chars[i + 2..].iter().position(|&c| c == ';')?;
+                                  let spec: String = chars[i + 2..end].iter().collect();
+                                  let mut parts = spec.split('|');
+                                  let name = parts.next().unwrap_or_default();
+                                  cur.font = (!name.is_empty()).then(|| name.to_string());
+                                  cur.bold = false;
+                                  cur.italic = false;
+                                  for part in parts {
+                                      if let Some(v) = part.strip_prefix('b') {
+                                          cur.bold = v != "0";
+                                      } else if let Some(v) = part.strip_prefix('i') {
+                                          cur.italic = v != "0";
+                                      }
+                                  }
+                                  i = end + 1;
+                              }
+                              _ => return None,
+                          }
+                      }
+                      c => {
+                          out.push((c, cur.clone()));
+                          i += 1;
+                      }
+                  }
+              }
+              let plain: String = out.iter().map(|(c, _)| *c).collect();
+              let mut runs = Vec::new();
+              let mut s = 0;
+              for k in 1..=out.len() {
+                  if k == out.len() || out[k].1 != out[s].1 {
+                      if out[s].1 != FontState::default() {
+                          runs.push((s, k, out[s].1.clone()));
+                      }
+                      s = k;
+                  }
+              }
+              Some((plain, runs))
+          }
+
+          /// Whether an MTEXT's contents can be edited in the formatted editor window.
+          pub(crate) fn can_edit_rich(contents: &str) -> bool {
+              parse_contents(contents).is_some_and(|(plain, _)| !plain.is_empty())
+          }
+
+          /// An existing MTEXT open in the editor window.
+          #[derive(Clone)]
+          struct Existing {
+              st: State,
+              /// The contents as the editor writes them before any change, to tell an edit from a no-op.
+              initial: String,
+              /// The drawing the window was opened for: a handle means nothing once another drawing is active.
+              uid: u64,
+              base_h: f64,
+              message: String,
+              focused: bool,
+          }
+
+          /// Load the MTEXT with handle `hex` into the editor: its text, and the font of each part.
+          fn load_existing(app: &CadApp, hex: &str) -> Option<Existing> {
+              let uid = app.session.state().map(|s| s.uid).unwrap_or_default();
+              let h = cadcraft_doc::Handle::parse_hex(hex)?;
+              let d = app.session.doc().ok()?;
+              let e = d.entity(h)?;
+              let cadcraft_engine::doc::EntityKind::MText(t) = &e.kind else { return None };
+              let (plain, runs) = parse_contents(&t.contents)?;
+              let mut fmt = Formatted::default();
+              if let Some(f) = d.text_style(&t.style).map(|s| s.font.clone()) {
+                  // A family name, not a font file (`txt.shx`, `arial.ttf`).
+                  if !f.is_empty() && !f.contains('.') {
+                      fmt.base_font = f;
+                  }
+              }
+              fmt.set_text(&plain, &CharFmt::default());
+              for (a, b, s) in runs {
+                  let (font, bold, italic, underline, overline) = (s.font.clone(), s.bold, s.italic, s.underline, s.overline);
+                  fmt.edit(a..b, |c| {
+                      if font.is_some() {
+                          c.font = font.clone();
+                      }
+                      c.bold = bold;
+                      c.italic = italic;
+                      c.underline = underline;
+                      c.overline = overline;
+                  });
+              }
+              let initial = fmt.to_contents();
+              let base_h = if t.height > 0.0 { t.height } else { 0.2 };
+              let st = State { fmt, typing: CharFmt::default(), typing_at: 0, top: 70.0, sel: (0, 0), caret: None };
+              Some(Existing { st, initial, uid, base_h, message: String::new(), focused: false })
+          }
+
+          /// Edit an existing MTEXT in a window (`spec` is `mtextedit:<hex handle>`): the toolbar, ruler and
+          /// formatted text box of the in-place editor, loaded with the text's own contents. Characters can
+          /// be inserted or deleted anywhere, and the font of any selected part changed.
+          pub fn edit_existing(app: &mut CadApp, ctx: &egui::Context, spec: &str, open: &mut bool) {
+              let hex = spec.strip_prefix("mtextedit:").unwrap_or_default().to_string();
+              let sid = egui::Id::new(("mtext_existing_state", hex.as_str()));
+              let cached: Option<Existing> = ctx.data_mut(|d| d.get_temp(sid));
+              let Some(mut ex) = cached.or_else(|| load_existing(app, &hex)) else {
+                  *open = false;
+                  return;
+              };
+              let t = Tokens::get();
+              let px = 22.0_f32;
+              let width = 560.0_f32;
+              let base_h = ex.base_h;
+              let mut keep = *open;
+              let mut done = Done::No;
+              egui::Window::new("Edit MTEXT").id(egui::Id::new("mtext_existing_window")).open(&mut keep).collapsible(false).resizable(false).show(ctx, |ui| {
+                  ui.set_width(width);
+                  toolbar(ui, &mut ex.st, base_h);
+                  ruler(ui, &mut ex.st, px, width, base_h);
+                  text_box(ui, &mut ex.st, base_h, px, width, &t);
+                  if !ex.focused {
+                      ui.ctx().memory_mut(|m| m.request_focus(edit_id()));
+                      ex.focused = true;
+                  }
+                  ui.horizontal(|ui| {
+                      ui.add_space(4.0);
+                      if ui.button(crate::tl!("OK")).clicked() {
+                          done = Done::Ok;
+                      }
+                      if ui.button(crate::tl!("Cancel")).clicked() {
+                          done = Done::Cancel;
+                      }
+                      let finish = if ui.ctx().os().is_mac() { crate::tl!("⌘↩ to finish") } else { crate::tl!("Ctrl+Enter to finish") };
+                      ui.label(RichText::new(finish).small().color(t.text_dim));
+                  });
+                  if !ex.message.is_empty() {
+                      ui.colored_label(ui.visuals().warn_fg_color, ex.message.as_str());
+                  }
+              });
+              if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+                  done = Done::Cancel;
+              } else if ctx.input(|i| i.modifiers.command && i.key_pressed(egui::Key::Enter)) {
+                  done = Done::Ok;
+              }
+              let mut close = !keep;
+              match done {
+                  Done::No => {}
+                  Done::Cancel => close = true,
+                  Done::Ok => {
+                      let contents = ex.st.fmt.to_contents();
+                      if ex.st.fmt.is_empty() {
+                          ex.message = "The text is empty.".to_string();
+                      } else if contents == ex.initial {
+                          // Typing and undoing back to the same text is not an edit: no command, so the undo
+                          // stack stays clean.
+                          close = true;
+                      } else if app.session.state().map(|s| s.uid).ok() != Some(ex.uid) {
+                          // The drawing switched while the window sat open: the handle now names another
+                          // drawing's object, so the commit is refused.
+                          ex.message = "The drawing changed. Close the window and open it again.".to_string();
+                      } else {
+                          match app.run("textedit", serde_json::json!({ "handles": [hex.clone()], "text": contents })) {
+                              Ok(_) => close = true,
+                              Err(e) => ex.message = e,
+                          }
+                      }
+                  }
+              }
+              *open = !close;
+              if close {
+                  // Nothing is kept: reopening reads the drawing's text, not an edit the user cancelled, and
+                  // the text box starts without the last text's caret and undo history.
+                  ctx.data_mut(|d| {
+                      d.remove::<Existing>(sid);
+                      d.remove::<egui::text_edit::TextEditState>(edit_id());
+                  });
+              } else {
+                  ctx.data_mut(|d| d.insert_temp(sid, ex));
+              }
+          }
+
+          '''
+
+          ed = read(f"{SRC}/mtext_editor.rs")
+          anchor = "#[cfg(test)]\nmod tests {"
+          if ed.count(anchor) != 1:
+              fail("#[cfg(test)] mod tests", ed.count(anchor))
+          write(f"{SRC}/mtext_editor.rs", ed.replace(anchor, NEW_CODE + anchor))
+
+          # ---- dialogs.rs: `mtextedit:<handle>` goes to the window ---------------------------------------------
+          dlg = read(f"{SRC}/dialogs.rs")
+          pat = re.compile(r"(?m)^([ \t]*)other => crate::managers::dialog\(app, ctx, other, &mut open\),$")
+          n = len(pat.findall(dlg))
+          if n != 1:
+              fail("managers::dialog arm", n)
+          dlg = pat.sub(
+              lambda m: f'{m.group(1)}o if o.starts_with("mtextedit:") => crate::mtext_editor::edit_existing(app, ctx, o, &mut open),\n{m.group(0)}',
+              dlg,
+          )
+          write(f"{SRC}/dialogs.rs", dlg)
+
+          # ---- canvas/pick.rs: a double-click on an MTEXT the editor can show opens the window ---------------------
+          pick = read(f"{SRC}/canvas/pick.rs")
+          old = '    app.start("textedit");\n'
+          if pick.count(old) != 1:
+              fail('app.start("textedit")', pick.count(old))
+          new = """    // MTEXT opens in the formatted editor, loaded with its own text and fonts; contents with codes the
+              // editor cannot show keep the command line, so editing never drops them.
+              let rich = cadcraft_engine::cmd::curves::pick_at(&app.session, p).and_then(|h| {
+                  let e = app.session.doc().ok()?.entity(h)?;
+                  match &e.kind {
+                      EntityKind::MText(t) if crate::mtext_editor::can_edit_rich(&t.contents) => Some(h),
+                      _ => None,
+                  }
+              });
+              if let Some(h) = rich {
+                  app.ui.dialog = Some(format!("mtextedit:{}", h.hex()));
+                  return true;
+              }
+          """
+          write(f"{SRC}/canvas/pick.rs", pick.replace(old, new + old))
+          print("MTEXT editor window applied")
+          PY_EOF
+          if python mtext_window.py; then
+            touch .mtext-applied
+          else
+            cp .pre-mtext/mtext_editor.rs crates/ui-egui/src/mtext_editor.rs
+            cp .pre-mtext/dialogs.rs crates/ui-egui/src/dialogs.rs
+            cp .pre-mtext/pick.rs crates/ui-egui/src/canvas/pick.rs
+            exit 1
+          fi
+          git status --short
+      - name: Searchable font list (type to filter) in Text Style and MTEXT
+        continue-on-error: true
+        shell: bash
+        run: |
+          mkdir -p .pre-search
+          cp crates/ui-egui/src/lib.rs .pre-search/lib.rs
+          cp crates/ui-egui/src/managers.rs .pre-search/managers.rs
+          cp crates/ui-egui/src/mtext_editor.rs .pre-search/mtext_editor.rs
+          cat > search_edit.py <<'PY_EOF'
+          import re
+          import sys
+
+          SRC = "crates/ui-egui/src"
+
+
+          def read(path):
+              return open(path, encoding="utf-8", newline="").read().replace("\r\n", "\n")
+
+
+          def write(path, s):
+              open(path, "w", encoding="utf-8", newline="\n").write(s)
+
+
+          def rx(anchor):
+              return re.compile(r"\s+".join(re.escape(t) for t in anchor.split()))
+
+
+          FONTSEARCH = r'''//! A font picker with a search field, like the font boxes of other Windows programs: click it and type
+          //! part of a name, the list narrows to the fonts that match; Up and Down move the highlight, Enter or a
+          //! click picks, Esc closes. A plain combo box has to be scrolled through every installed family.
+
+          use egui::{Id, Key, Modifiers, Order, Ui};
+
+          /// The choices that match `query`: every word of it is part of the name (any case), names that start
+          /// with the query first, the rest in their own order.
+          pub(crate) fn matching(choices: &[String], query: &str) -> Vec<String> {
+              let q = query.trim().to_lowercase();
+              let words: Vec<&str> = q.split_whitespace().collect();
+              let mut out: Vec<String> = choices
+                  .iter()
+                  .filter(|c| {
+                      let low = c.to_lowercase();
+                      words.iter().all(|w| low.contains(w))
+                  })
+                  .cloned()
+                  .collect();
+              if !q.is_empty() {
+                  out.sort_by_key(|c| !c.to_lowercase().starts_with(&q));
+              }
+              out
+          }
+
+          #[derive(Clone, Default)]
+          struct State {
+              query: String,
+              open: bool,
+              highlight: usize,
+          }
+
+          /// The picker: a text field that shows `current` (and becomes the search box when it has the focus) with
+          /// an arrow beside it. `choices` is asked for only while the list is open. Returns the name picked in
+          /// this frame.
+          pub(crate) fn font_combo(ui: &mut Ui, id: Id, current: &str, width: f32, choices: impl FnOnce() -> Vec<String>) -> Option<String> {
+              let mut st: State = ui.data_mut(|d| d.get_temp::<State>(id)).unwrap_or_default();
+              let mut picked: Option<String> = None;
+              let field_id = id.with("field");
+
+              let mut text = if st.open { st.query.clone() } else { current.to_string() };
+              let r = ui.add(egui::TextEdit::singleline(&mut text).id(field_id).desired_width(width).hint_text(current.to_string()));
+              let arrow = ui.small_button("\u{25be}");
+
+              if r.gained_focus() && !st.open {
+                  st.open = true;
+                  st.query.clear();
+                  st.highlight = 0;
+              }
+              if arrow.clicked() {
+                  st.open = !st.open;
+                  st.query.clear();
+                  st.highlight = 0;
+                  if st.open {
+                      ui.memory_mut(|m| m.request_focus(field_id));
+                  }
+              }
+              if r.changed() && st.open {
+                  st.query = text;
+                  st.highlight = 0;
+              }
+
+              if st.open {
+                  let list = matching(&choices(), &st.query);
+                  let count = list.len();
+                  st.highlight = if count == 0 { 0 } else { st.highlight.min(count - 1) };
+                  let mut moved = false;
+                  if r.has_focus() {
+                      if ui.input_mut(|i| i.consume_key(Modifiers::NONE, Key::ArrowDown)) && count > 0 {
+                          st.highlight = (st.highlight + 1).min(count - 1);
+                          moved = true;
+                      }
+                      if ui.input_mut(|i| i.consume_key(Modifiers::NONE, Key::ArrowUp)) {
+                          st.highlight = st.highlight.saturating_sub(1);
+                          moved = true;
+                      }
+                  }
+                  if r.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
+                      picked = list.get(st.highlight).cloned();
+                  }
+
+                  let min_w = (r.rect.width() + 20.0).max(220.0);
+                  let area = egui::Area::new(id.with("list"))
+                      .order(Order::Foreground)
+                      .fixed_pos(r.rect.left_bottom())
+                      .constrain(true)
+                      .show(ui.ctx(), |ui| {
+                          egui::Frame::popup(ui.style()).show(ui, |ui| {
+                              ui.set_min_width(min_w);
+                              egui::ScrollArea::vertical().id_salt("fontlist").max_height(260.0).show(ui, |ui| {
+                                  for (i, name) in list.iter().enumerate() {
+                                      let resp = ui.selectable_label(i == st.highlight, name.as_str());
+                                      if moved && i == st.highlight {
+                                          resp.scroll_to_me(None);
+                                      }
+                                      if resp.clicked() {
+                                          picked = Some(name.clone());
+                                      }
+                                  }
+                                  if list.is_empty() {
+                                      ui.weak("No font matches");
+                                  }
+                              });
+                          });
+                      });
+
+                  let area_rect = area.response.rect;
+                  let outside = ui.input(|i| {
+                      i.pointer.any_pressed() && i.pointer.interact_pos().is_some_and(|p| !r.rect.contains(p) && !arrow.rect.contains(p) && !area_rect.contains(p))
+                  });
+                  let escape = ui.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Escape));
+                  if outside || escape || picked.is_some() {
+                      st.open = false;
+                      st.query.clear();
+                      st.highlight = 0;
+                      if r.has_focus() {
+                          ui.memory_mut(|m| m.surrender_focus(field_id));
+                      }
+                  }
+              }
+              ui.data_mut(|d| d.insert_temp(id, st));
+              picked
+          }
+          '''
+
+          LIST_RE = rx('mod mtext_editor;')
+
+          MANAGERS_OLD = """craft_ui::ComboBox::from_id_salt((cmd, *key)).selected_text(v.as_str()).show_ui(ui, |ui| {
+              egui::ScrollArea::vertical().id_salt((cmd, *key, "choices")).max_height(280.0).show(ui, |ui| {
+                  for c in choices {
+                      if ui.selectable_label(c == v, c).clicked() && c != v {
+                          picked = Some(c.clone());
+                      }
+                  }
+              });
+          });"""
+          MANAGERS_NEW = """if choices.len() > 12 {
+              // A long list (the installed fonts): a field that narrows the list as it is typed in.
+              picked = crate::fontsearch::font_combo(ui, egui::Id::new((cmd, *key, "search")), v.as_str(), 170.0, || choices.iter().cloned().collect());
+          } else {
+              craft_ui::ComboBox::from_id_salt((cmd, *key)).selected_text(v.as_str()).show_ui(ui, |ui| {
+                  egui::ScrollArea::vertical().id_salt((cmd, *key, "choices")).max_height(280.0).show(ui, |ui| {
+                      for c in choices {
+                          if ui.selectable_label(c == v, c).clicked() && c != v {
+                              picked = Some(c.clone());
+                          }
+                      }
+                  });
+              });
+          }"""
+
+          MTEXT_RE = re.compile(
+              r'craft_ui::ComboBox::from_id_salt\("mtext_font"\).*?\.accessible_name\(crate::tl!\("Font"\)\);',
+              re.S,
+          )
+          MTEXT_NEW = """if let Some(fam) = crate::fontsearch::font_combo(ui, egui::Id::new("mtext_font_combo"), &shown, 150.0, || font_choices(cur.font.as_deref())) {
+                  change(st, |c| c.font = Some(fam.clone()));
+                  refocus = true;
+              }"""
+
+          applied = []
+
+          # lib.rs: the module
+          lib = read(f"{SRC}/lib.rs")
+          if len(LIST_RE.findall(lib)) != 1:
+              print(f"::error::Searchable font list NOT applied: 'mod mtext_editor;' matched {len(LIST_RE.findall(lib))} times")
+              sys.exit(1)
+          lib = LIST_RE.sub(lambda m: "mod fontsearch;\n" + m.group(0), lib)
+
+          # managers.rs: Text Style (and any other long choice list)
+          managers_path = f"{SRC}/managers.rs"
+          managers = read(managers_path)
+          pat = rx(MANAGERS_OLD)
+          new_managers = None
+          if len(pat.findall(managers)) == 1:
+              new_managers = pat.sub(lambda m: MANAGERS_NEW, managers)
+              applied.append("Text Style")
+          else:
+              print(f"::warning::Searchable font list: Text Style anchor matched {len(pat.findall(managers))} times, skipped")
+
+          # mtext_editor.rs: the MTEXT toolbar
+          mtext_path = f"{SRC}/mtext_editor.rs"
+          mtext = read(mtext_path)
+          new_mtext = None
+          if len(MTEXT_RE.findall(mtext)) == 1:
+              new_mtext = MTEXT_RE.sub(lambda m: MTEXT_NEW, mtext)
+              applied.append("MTEXT toolbar")
+          else:
+              print(f"::warning::Searchable font list: MTEXT toolbar anchor matched {len(MTEXT_RE.findall(mtext))} times, skipped")
+
+          if not applied:
+              sys.exit(1)
+
+          write(f"{SRC}/lib.rs", lib)
+          write(f"{SRC}/fontsearch.rs", FONTSEARCH)
+          if new_managers is not None:
+              write(managers_path, new_managers)
+          if new_mtext is not None:
+              write(mtext_path, new_mtext)
+          print("Searchable font list applied: " + ", ".join(applied))
+          PY_EOF
+          if python search_edit.py; then
+            touch .search-applied
+          else
+            cp .pre-search/lib.rs crates/ui-egui/src/lib.rs
+            cp .pre-search/managers.rs crates/ui-egui/src/managers.rs
+            cp .pre-search/mtext_editor.rs crates/ui-egui/src/mtext_editor.rs
+            rm -f crates/ui-egui/src/fontsearch.rs
+            exit 1
+          fi
+          git status --short
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Test fonts crate
+        continue-on-error: true
+        run: cargo test -p cadcraft-fonts
+      - name: Build
+        shell: bash
+        run: |
+          set +e
+          export CARGO_TERM_COLOR=never
+          build() { cargo build --release -p cadcraft 2>&1 | tee "$1"; return "${PIPESTATUS[0]}"; }
+          report() {
+            echo "::warning::The build with $2 did not compile - building again without it. The errors are in the run summary."
+            { echo "### $2: compile errors"; echo '```'; sed 's/\x1b\[[0-9;]*m//g' "$1" | grep -A14 "^error" | head -90; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+          }
+          n=1; build build1.log; rc=$?; last=build1.log
+          drop() {
+            case "$1" in
+              search) cp .pre-search/lib.rs crates/ui-egui/src/lib.rs; cp .pre-search/managers.rs crates/ui-egui/src/managers.rs; cp .pre-search/mtext_editor.rs crates/ui-egui/src/mtext_editor.rs; rm -f crates/ui-egui/src/fontsearch.rs ;;
+              mtext) cp .pre-mtext/mtext_editor.rs crates/ui-egui/src/mtext_editor.rs; cp .pre-mtext/dialogs.rs crates/ui-egui/src/dialogs.rs; cp .pre-mtext/pick.rs crates/ui-egui/src/canvas/pick.rs ;;
+              edit) cp .pre-edit/lib.rs crates/ui-egui/src/lib.rs; cp .pre-edit/dialogs.rs crates/ui-egui/src/dialogs.rs; cp .pre-edit/pick.rs crates/ui-egui/src/canvas/pick.rs; cp .pre-edit/theme.rs crates/ui-egui/src/theme.rs; rm -f crates/ui-egui/src/textdlg.rs ;;
+              caret) cp .pre-caret/cmdline.rs crates/ui-egui/src/cmdline.rs ;;
+              alice) cp .pre-alice/ttf.rs crates/fonts/src/ttf.rs; cp .pre-alice/theme.rs crates/ui-egui/src/theme.rs; cp .pre-alice/mtext_editor.rs crates/ui-egui/src/mtext_editor.rs ;;
+            esac
+            rm -f ".$1-applied"
+          }
+          for s in search mtext edit caret alice; do
+            if [ "$rc" -ne 0 ] && [ -f ".$s-applied" ]; then
+              report "$last" "the $s patch"
+              drop "$s"
+              n=$((n+1)); last="build$n.log"; build "$last"; rc=$?
+            fi
+          done
+          exit "$rc"
+      - name: What is in this build
+        if: always()
+        shell: bash
+        run: |
+          mkdir -p out
+          if [ -f target/release/cadcraft.exe ]; then cp target/release/cadcraft.exe out/; fi
+          has() { if grep -q "$1" "$2" 2>/dev/null; then echo yes; else echo NO; fi; }
+          {
+            echo "## What is in this build (v9)"
+            echo "- Lao shaping, tone marks, font list: $(has installed_families crates/fonts/src/ttf.rs)"
+            echo "- Font dropdown in MTEXT: $(has font_choices crates/ui-egui/src/mtext_editor.rs)"
+            echo "- Lao/Thai letters in the interface: $(has lao_thai_fonts crates/ui-egui/src/theme.rs)"
+            echo "- Alice_0, Alice_1 ... shown in their own font: $(has legacy_lao_family crates/ui-egui/src/mtext_editor.rs)"
+            echo "- Command line: caret, insert/erase inside the text: $(has insert_at_caret crates/ui-egui/src/cmdline.rs)"
+            echo "- Edit Text window (TEXT, attribute definitions): $(has textdlg crates/ui-egui/src/lib.rs)"
+            echo "- MTEXT editor window (existing MTEXT): $(has edit_existing crates/ui-egui/src/mtext_editor.rs)"
+            echo "- Searchable font list (type to filter): $(has font_combo crates/ui-egui/src/fontsearch.rs)"
+          } | tee out/build-info.txt >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cadcraft-windows-lao-v9
+          path: out/
